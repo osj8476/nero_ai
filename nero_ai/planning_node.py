@@ -2,13 +2,13 @@ import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
 from geometry_msgs.msg import PoseStamped
+from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+from builtin_interfaces.msg import Duration
 import json
-import time
 
-# 그리퍼 열림/닫힘 값 (Jetson에서 실제 값 확인 후 수정)
-# TODO: ros2 interface show agx_arm_msgs/msg/HandCmd 로 필드 확인 필요
-GRIPPER_OPEN  = 1.0
-GRIPPER_CLOSE = 0.0
+GRIPPER_OPEN  = 0.04  # 4cm 열림
+GRIPPER_CLOSE = 0.0   # 완전 닫힘
+
 
 class PlanningNode(Node):
     def __init__(self):
@@ -19,16 +19,12 @@ class PlanningNode(Node):
         self.sub_cmd = self.create_subscription(
             String, '/arm_command', self.on_command, 10)
 
-        # 이동 퍼블리셔
         self.pub_move = self.create_publisher(PoseStamped, '/control/move_p', 10)
-
-        # 그리퍼 퍼블리셔 (String으로 임시 — HandCmd 구조 확인 후 교체)
-        # TODO: from agx_arm_msgs.msg import HandCmd
-        self.pub_hand = self.create_publisher(String, '/control/hand_raw', 10)
+        self.pub_gripper = self.create_publisher(
+            JointTrajectory, '/gripper_controller/joint_trajectory', 10)
 
         self.target_label = None
-        self.target_position = None
-        self.state = 'idle'  # idle → moving → gripping → done
+        self.state = 'idle'
 
         self.get_logger().info('PlanningNode 준비 완료')
 
@@ -41,39 +37,36 @@ class PlanningNode(Node):
     def on_objects(self, msg: String):
         if not self.target_label or self.state != 'idle':
             return
-
         objects = json.loads(msg.data).get('objects', [])
         for obj in objects:
             if obj['label'] == self.target_label:
                 self.get_logger().info(f'물체 발견! {obj}')
-                pos = obj['center_3d']
-                self.target_position = pos
                 self.state = 'moving'
-                self.execute_pick(pos)
+                self.execute_pick(obj['center_3d'])
                 break
 
     def execute_pick(self, pos: dict):
-        """물체 집기 시퀀스: 접근 → 그리퍼 열기 → 내려가기 → 그리퍼 닫기 → 들어올리기"""
+        x, y, z = pos['x'], pos['y'], pos['z']
 
-        # 1단계: 물체 위 10cm로 접근
+        # 1단계: 물체 위 10cm 접근
         self.get_logger().info('1단계: 물체 위로 접근')
-        self.send_move(pos['x'], pos['y'], pos['z'] + 0.10)
+        self.send_move(x, y, z + 0.10)
 
         # 2단계: 그리퍼 열기
         self.get_logger().info('2단계: 그리퍼 열기')
         self.send_gripper(GRIPPER_OPEN)
 
-        # 3단계: 물체 위치로 내려가기
+        # 3단계: 물체로 내려가기
         self.get_logger().info('3단계: 물체로 내려가기')
-        self.send_move(pos['x'], pos['y'], pos['z'] + 0.02)
+        self.send_move(x, y, z + 0.02)
 
-        # 4단계: 그리퍼 닫기 (집기)
-        self.get_logger().info('4단계: 그리퍼 닫기 (집기)')
+        # 4단계: 그리퍼 닫기
+        self.get_logger().info('4단계: 그리퍼 닫기')
         self.send_gripper(GRIPPER_CLOSE)
 
         # 5단계: 들어올리기
         self.get_logger().info('5단계: 들어올리기')
-        self.send_move(pos['x'], pos['y'], pos['z'] + 0.15)
+        self.send_move(x, y, z + 0.15)
 
         self.state = 'done'
         self.target_label = None
@@ -92,17 +85,21 @@ class PlanningNode(Node):
         self.get_logger().info(f'move_p 발행: x={x:.2f} y={y:.2f} z={z:.2f}')
 
     def send_gripper(self, value: float):
-        # TODO: HandCmd 필드 확인 후 실제 메시지로 교체
-        # Jetson에서: ros2 interface show agx_arm_msgs/msg/HandCmd
-        msg = String()
-        msg.data = json.dumps({"gripper": value})
-        self.pub_hand.publish(msg)
-        self.get_logger().info(f'그리퍼 명령: {value}')
+        traj = JointTrajectory()
+        traj.joint_names = ['gripper_joint1', 'gripper_joint2']
+        pt = JointTrajectoryPoint()
+        pt.positions = [value, value]
+        pt.time_from_start = Duration(sec=1)
+        traj.points = [pt]
+        self.pub_gripper.publish(traj)
+        self.get_logger().info(f'그리퍼: {"열기" if value > 0 else "닫기"} ({value}m)')
+
 
 def main():
     rclpy.init()
     rclpy.spin(PlanningNode())
     rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()
