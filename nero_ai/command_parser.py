@@ -1,81 +1,140 @@
+#!/usr/bin/env python3
+"""
+command_parser.py (MCP 클라이언트 버전 — 전면 개편)
+억지 프롬프트/JSON 파싱 제거. Gemini SDK 에 MCP 세션을 tools=[session] 로
+전달 → Automatic Function Calling 으로 자연어 → Tool 자동 호출.
+/user_command 수신 → Gemini+MCP → (서버가) /arm_command 발행.
+"""
+
+import os
+import asyncio
+import threading
+
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
+
 from google import genai
-import json, os
+from google.genai import types
+
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+
+
+SERVER_PARAMS = StdioServerParameters(
+    command="python3",
+    args=[os.environ.get(
+        "MCP_SERVER_PATH",
+        os.path.join(os.path.dirname(__file__), "mcp_robot_server.py"),
+    )],
+    env=os.environ.copy(),
+)
+
+SYSTEM_INSTRUCTION = (
+    "너는 AgileX Nero 로봇 팔 픽앤플레이스 시스템의 두뇌다. "
+    "사용자의 한국어/영어 자연어 명령을 받아 적절한 도구를 호출해 로봇을 제어한다. "
+    "물체를 집으라는 요청을 받으면, 먼저 list_detected_objects 로 현재 장면에 "
+    "어떤 물체가 있는지 확인한 뒤, 그 안의 라벨로 pick_object 를 호출하라. "
+    "장면에 없는 물체를 요청받으면 집으려 시도하지 말고 사용자에게 알려라."
+)
+
 
 class CommandParserNode(Node):
-    def __init__(self):
+    def __init__(self, loop: asyncio.AbstractEventLoop):
         super().__init__('command_parser')
-
-        api_key = os.environ.get("GEMINI_API_KEY", "")
-        if not api_key:
-            self.get_logger().error('GEMINI_API_KEY 환경변수가 없습니다!')
-        self.client = genai.Client(api_key=api_key)
-
-        self.pub     = self.create_publisher(String, '/arm_command', 10)
+        self._loop = loop
         self.sub_cmd = self.create_subscription(
             String, '/user_command', self.on_command, 10)
-        self.sub_obj = self.create_subscription(
-            String, '/detected_objects', self.on_objects, 10)
-
-        self.latest_objects = []
-        self.get_logger().info('CommandParser 준비 완료 (Gemini + MoonDream2 모드)')
-
-    def on_objects(self, msg: String):
-        try:
-            data = json.loads(msg.data)
-            self.latest_objects = data.get("objects", [])
-        except json.JSONDecodeError:
-            pass
+        self.pub_reply = self.create_publisher(String, '/assistant_reply', 10)
+        self.get_logger().info(
+            'CommandParser 준비 완료 (Gemini + MCP Tool Call 모드)')
 
     def on_command(self, msg: String):
         user_text = msg.data
         self.get_logger().info(f'명령 수신: {user_text}')
+        asyncio.run_coroutine_threadsafe(
+            self._handle(user_text), self._loop)
 
-        if self.latest_objects:
-            scene_info = ", ".join([
-                f"{o.get('label','?')} at {o.get('center_3d', {})}"
-                for o in self.latest_objects
-            ])
-        else:
-            scene_info = "장면 정보 없음"
-
-        prompt = f"""당신은 로봇 팔 제어 시스템입니다.
-아래 JSON만 출력하세요. 다른 텍스트, 마크다운 절대 금지.
-{{"target_label": "물체이름(영어 소문자)", "action": "pick"}}
-
-현재 장면의 물체: {scene_info}
-명령: {user_text}
-
-장면에 있는 물체 중에서만 선택하세요."""
-
-        # 수정: resp 스코프 버그 수정
-        resp = None
+    async def _handle(self, user_text: str):
         try:
-            resp = self.client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=prompt
-            )
-            raw = resp.text.strip().strip('```json').strip('```').strip()
-            cmd = json.loads(raw)
-
-            out      = String()
-            out.data = json.dumps(cmd)
-            self.pub.publish(out)
-            self.get_logger().info(f'파싱 결과: {cmd}')
-
-        except json.JSONDecodeError as e:
-            raw_text = resp.text if resp else "응답 없음"
-            self.get_logger().error(f'JSON 파싱 실패: {e} / 원문: {raw_text}')
+            reply = await run_llm_turn(user_text)
+            self.get_logger().info(f'처리 완료: {reply}')
+            out = String()
+            out.data = reply
+            self.pub_reply.publish(out)
         except Exception as e:
-            self.get_logger().error(f'Gemini 오류: {e}')
+            self.get_logger().error(f'LLM/MCP 처리 오류: {e}')
+
+
+_session: ClientSession | None = None
+_session_ready = asyncio.Event()
+_gemini: genai.Client | None = None
+
+
+async def _session_owner():
+    global _session
+    async with stdio_client(SERVER_PARAMS) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            _session = session
+            _session_ready.set()
+            await asyncio.Event().wait()
+
+
+async def run_llm_turn(user_text: str) -> str:
+    await _session_ready.wait()
+    response = await _gemini.aio.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=user_text,
+        config=types.GenerateContentConfig(
+            temperature=0,
+            system_instruction=SYSTEM_INSTRUCTION,
+            tools=[_session],
+        ),
+    )
+    return response.text or "(완료)"
+
+
+def _ros_spin(node: Node):
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+
+
+async def main_async():
+    global _gemini
+    api_key = os.environ.get("GEMINI_API_KEY", "")
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY 환경변수가 없습니다!")
+    _gemini = genai.Client(api_key=api_key)
+
+    owner_task = asyncio.create_task(_session_owner())
+    await _session_ready.wait()
+
+    rclpy.init()
+    loop = asyncio.get_running_loop()
+    node = CommandParserNode(loop)
+    spin_thread = threading.Thread(
+        target=_ros_spin, args=(node,), daemon=True)
+    spin_thread.start()
+
+    node.get_logger().info('MCP 세션 연결 완료. /user_command 대기 중...')
+
+    try:
+        await asyncio.Event().wait()
+    finally:
+        owner_task.cancel()
+        node.destroy_node()
+        rclpy.shutdown()
 
 
 def main():
-    rclpy.init()
-    rclpy.spin(CommandParserNode())
-    rclpy.shutdown()
+    try:
+        asyncio.run(main_async())
+    except KeyboardInterrupt:
+        pass
+
 
 if __name__ == '__main__':
     main()

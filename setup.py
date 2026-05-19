@@ -8,6 +8,7 @@ setup(
     entry_points={
         'console_scripts': [
             'command_parser  = nero_ai.command_parser:main',
+	    'mcp_robot_server = nero_ai.mcp_robot_server:main',
             'planning_node   = nero_ai.planning_node:main',
             'perception_node = nero_ai.perception_node:main',
         ],
