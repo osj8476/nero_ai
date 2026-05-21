@@ -1,28 +1,39 @@
 #!/usr/bin/env python3
 """
 perception_node.py
-MoonDream2 기반 객체 인식 노드.
-- encode_image 한 번 + 라벨별 detect (테스트 성공 코드 방식)
-- FP16 + autocast로 추론 가속
-- 320x180 다운스케일 추론, 원본 해상도 좌표 환산
-- filter_detections로 오탐 제거
-- 좌표 변환은 camera_calibration 모듈로 분리
+RealSense RGB-D + MoonDream2 멀티서버 클라이언트 버전.
+
+[변경점]
+1. USB 웹캠 → Intel RealSense (pyrealsense2)
+   - RGB + depth 동시 수신, 정렬(align)
+2. 단일 모델 인스턴스 → N개 서버에 round-robin 분산
+   - moondream_server 가 :8000 ~ :8000+N-1 에서 돈다고 가정
+   - perception_node 는 얇은 클라이언트만 됨 (GPU 메모리 점유 X)
+3. depth 값으로 실제 z 측정 → camera_calibration.pixel_to_robot_xyz 에 전달
+
+다른 RGB-D 카메라(Orbbec 등) 쓰면 _init_camera / _capture_loop 만 갈아끼우면 됨.
 """
 
 import os
 import json
+import base64
 import threading
 import time
+from collections import deque
+from typing import Optional
 
 import cv2
-import torch
+import numpy as np
+import requests
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from std_msgs.msg import String
 
-from PIL import Image as PILImage
-from transformers import AutoModelForCausalLM
+try:
+    import pyrealsense2 as rs
+except ImportError:
+    rs = None
 
 from nero_ai.camera_calibration import pixel_to_robot_xyz
 
@@ -30,46 +41,67 @@ from nero_ai.camera_calibration import pixel_to_robot_xyz
 # ──────────────────────────────────────────────
 # 설정
 # ──────────────────────────────────────────────
-CAMERA_SOURCE  = os.environ.get("CAMERA_SOURCE", "0")
 TARGET_OBJECTS = os.environ.get(
     "TARGET_OBJECTS", "cup,bottle,scissors,phone,box,book"
 ).split(",")
-POLL_INTERVAL  = float(os.environ.get("POLL_INTERVAL", "0.3"))
-MODEL_REVISION = os.environ.get("MODEL_REVISION", "2025-06-21")
+TARGET_OBJECTS = [t.strip() for t in TARGET_OBJECTS if t.strip()]
 
+# 추론 클러스터
+CLUSTER_HOST = os.environ.get("CLUSTER_HOST", "127.0.0.1")
+CLUSTER_N = int(os.environ.get("CLUSTER_N", "10"))
+BASE_PORT = int(os.environ.get("BASE_PORT", "8000"))
+SERVER_URLS = [
+    f"http://{CLUSTER_HOST}:{BASE_PORT + i}/detect"
+    for i in range(CLUSTER_N)
+]
+REQUEST_TIMEOUT = float(os.environ.get("REQUEST_TIMEOUT", "2.0"))
+DISPATCH_RATE_HZ = float(os.environ.get("DISPATCH_RATE_HZ", "20.0"))
+
+# 추론 입력 해상도 (네트워크 + GPU 부하 절감)
 INFER_W = int(os.environ.get("INFER_W", "320"))
 INFER_H = int(os.environ.get("INFER_H", "180"))
 
+# 카메라 해상도
+CAM_W = int(os.environ.get("CAM_W", "640"))
+CAM_H = int(os.environ.get("CAM_H", "480"))
+CAM_FPS = int(os.environ.get("CAM_FPS", "30"))
+
+# 오탐 필터
 MIN_BBOX_SIZE = 0.02
-DEDUP_THRESH  = 0.08
+DEDUP_THRESH = 0.08
 
 
-def filter_detections(objects):
-    """크기 필터 + 중복 제거."""
+def filter_detections(dets):
+    """크기 필터 + 중복 제거. dets: [{label,x_min,y_min,x_max,y_max}]."""
     filtered = []
-    for det in objects:
-        w = det.get("x_max", 0) - det.get("x_min", 0)
-        h = det.get("y_max", 0) - det.get("y_min", 0)
+    for d in dets:
+        w = d["x_max"] - d["x_min"]
+        h = d["y_max"] - d["y_min"]
         if w < MIN_BBOX_SIZE or h < MIN_BBOX_SIZE:
             continue
-        cx = det["x_min"] + w / 2
-        cy = det["y_min"] + h / 2
+        cx = d["x_min"] + w / 2
+        cy = d["y_min"] + h / 2
         too_close = any(
-            abs(cx - (f["x_min"] + (f["x_max"]-f["x_min"])/2)) < DEDUP_THRESH and
-            abs(cy - (f["y_min"] + (f["y_max"]-f["y_min"])/2)) < DEDUP_THRESH
+            abs(cx - (f["x_min"] + (f["x_max"] - f["x_min"]) / 2)) < DEDUP_THRESH
+            and abs(cy - (f["y_min"] + (f["y_max"] - f["y_min"]) / 2)) < DEDUP_THRESH
+            and f["label"] == d["label"]
             for f in filtered
         )
         if not too_close:
-            filtered.append(det)
+            filtered.append(d)
     return filtered
 
 
 class PerceptionNode(Node):
-
     def __init__(self):
         super().__init__('perception_node')
 
-        # perception은 최신만 중요 → BEST_EFFORT + KEEP_LAST(1)
+        if rs is None:
+            self.get_logger().error(
+                'pyrealsense2 미설치. pip3 install pyrealsense2 --break-system-packages')
+            raise RuntimeError("pyrealsense2 not installed")
+
+        # /detected_objects 는 최신만 중요
         qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
@@ -77,144 +109,179 @@ class PerceptionNode(Node):
         )
         self.pub = self.create_publisher(String, '/detected_objects', qos)
 
-        # ── 디바이스 ──
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        if self.device == "cuda":
-            name = torch.cuda.get_device_name(0)
-            mem  = torch.cuda.get_device_properties(0).total_memory / 1024**3
-            self.get_logger().info(f'GPU: {name} | VRAM: {mem:.1f} GB')
-        else:
-            self.get_logger().warn('CPU 모드 (느림)')
+        # ── RealSense 초기화 ──
+        self._init_camera()
 
-        # ── 모델 로드 (FP16) ──
-        self.get_logger().info('MoonDream2 모델 로딩 중...')
-        self.model = AutoModelForCausalLM.from_pretrained(
-            "vikhyatk/moondream2",
-            revision=MODEL_REVISION,
-            trust_remote_code=True,
-            device_map={"": self.device},
-        )
-        self.model.eval()
-        if self.device == "cuda":
-            self.model = self.model.to(torch.float16)
-        self.get_logger().info('MoonDream2 로드 완료!')
+        # ── 공유 상태 ──
+        self.frame_lock = threading.Lock()
+        self.latest_color: Optional[np.ndarray] = None
+        self.latest_depth: Optional[np.ndarray] = None  # depth in meters
+        self.frame_idx = 0
 
-        # ── 카메라 ──
-        source = int(CAMERA_SOURCE) if CAMERA_SOURCE.isdigit() else CAMERA_SOURCE
-        self.cap = cv2.VideoCapture(source)
-        if not self.cap.isOpened():
-            self.get_logger().error(f'카메라 열기 실패: {CAMERA_SOURCE}')
-            raise RuntimeError("카메라 초기화 실패")
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        # ── 클러스터 헬스체크 ──
+        ready = self._wait_for_cluster()
+        if ready == 0:
+            self.get_logger().error(
+                f'클러스터 응답 없음. scripts/run_cluster.sh start {CLUSTER_N} 실행했는지 확인.')
+            raise RuntimeError("no moondream servers available")
+        self.get_logger().info(f'클러스터 {ready}/{CLUSTER_N} 서버 ready')
 
-        # 워밍업
-        for _ in range(30):
-            self.cap.read()
+        # ── 스레드 시작 ──
+        threading.Thread(target=self._capture_loop, daemon=True).start()
 
-        self.frame_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        self.frame_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        # 디스패치 타이머 (한 프레임당 1요청 round-robin)
+        self.timer = self.create_timer(
+            1.0 / DISPATCH_RATE_HZ, self._dispatch_inference)
+
         self.get_logger().info(
-            f'카메라: {self.frame_w}x{self.frame_h} | 추론: {INFER_W}x{INFER_H}')
+            f'PerceptionNode 시작 | 대상: {TARGET_OBJECTS} | '
+            f'서버: {CLUSTER_N}개 @ {CLUSTER_HOST}:{BASE_PORT}+')
 
-        self.latest_frame = None
-        self.frame_lock   = threading.Lock()
+    def _init_camera(self):
+        self.rs_pipe = rs.pipeline()
+        cfg = rs.config()
+        cfg.enable_stream(rs.stream.color, CAM_W, CAM_H, rs.format.bgr8, CAM_FPS)
+        cfg.enable_stream(rs.stream.depth, CAM_W, CAM_H, rs.format.z16, CAM_FPS)
+        profile = self.rs_pipe.start(cfg)
 
-        self.capture_thread = threading.Thread(
-            target=self._capture_loop, daemon=True)
-        self.capture_thread.start()
+        # depth → color 정렬 (같은 픽셀 좌표에서 depth 조회 가능하게)
+        self.rs_align = rs.align(rs.stream.color)
 
-        self.timer = self.create_timer(POLL_INTERVAL, self.run_detection)
+        # depth scale: raw uint16 → meters
+        depth_sensor = profile.get_device().first_depth_sensor()
+        self.depth_scale = depth_sensor.get_depth_scale()
         self.get_logger().info(
-            f'PerceptionNode 시작 | 대상: {TARGET_OBJECTS} | 주기: {POLL_INTERVAL}s')
+            f'RealSense: {CAM_W}x{CAM_H}@{CAM_FPS}fps | depth_scale={self.depth_scale}')
 
     def _capture_loop(self):
         while rclpy.ok():
-            ret, frame = self.cap.read()
-            if ret:
+            try:
+                frames = self.rs_pipe.wait_for_frames(timeout_ms=1000)
+                aligned = self.rs_align.process(frames)
+                color = aligned.get_color_frame()
+                depth = aligned.get_depth_frame()
+                if not color or not depth:
+                    continue
+                color_np = np.asanyarray(color.get_data())
+                depth_np = np.asanyarray(depth.get_data()).astype(np.float32)
+                depth_np *= self.depth_scale  # → meters
                 with self.frame_lock:
-                    self.latest_frame = frame
-            else:
-                time.sleep(0.005)
+                    self.latest_color = color_np
+                    self.latest_depth = depth_np
+            except Exception as e:
+                self.get_logger().warn(f'프레임 수신 실패: {e}')
+                time.sleep(0.05)
 
-    def run_detection(self):
-        t0 = time.time()
-
-        with self.frame_lock:
-            if self.latest_frame is None:
-                return
-            frame = self.latest_frame.copy()
-
-        # ── 저해상도 추론용 변환 ──
-        small = cv2.resize(frame, (INFER_W, INFER_H))
-        rgb   = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
-        pil_image = PILImage.fromarray(rgb)
-
-        detected_objects = []
-
-        try:
-            with torch.amp.autocast('cuda', enabled=(self.device == "cuda")):
-                # 한 번 인코딩 → 라벨별 재사용 (큰 속도 향상)
+    def _wait_for_cluster(self, timeout: float = 90.0) -> int:
+        """클러스터가 ready 될 때까지 대기. 응답한 서버 개수 반환."""
+        deadline = time.time() + timeout
+        ready_count = 0
+        while time.time() < deadline:
+            ready_count = 0
+            for i in range(CLUSTER_N):
+                url = f"http://{CLUSTER_HOST}:{BASE_PORT + i}/health"
                 try:
-                    image_embeds = self.model.encode_image(pil_image)
-                    use_embeds = True
-                except Exception as e:
-                    self.get_logger().warn(f'encode_image 실패, fallback: {e}')
-                    use_embeds = False
+                    r = requests.get(url, timeout=0.5)
+                    if r.status_code == 200:
+                        ready_count += 1
+                except Exception:
+                    pass
+            if ready_count >= max(1, CLUSTER_N // 2):  # 과반수면 시작
+                return ready_count
+            self.get_logger().info(
+                f'클러스터 대기 중... ({ready_count}/{CLUSTER_N})')
+            time.sleep(5.0)
+        return ready_count
 
-                for obj_label in TARGET_OBJECTS:
-                    obj_label = obj_label.strip()
-                    try:
-                        target = image_embeds if use_embeds else pil_image
-                        result  = self.model.detect(target, obj_label)
-                        objects = result.get("objects", [])
-                        filtered = filter_detections(objects)
+    def _dispatch_inference(self):
+        """주기적으로 한 프레임을 한 서버에 던짐. 응답은 별도 스레드에서 처리."""
+        with self.frame_lock:
+            if self.latest_color is None or self.latest_depth is None:
+                return
+            color = self.latest_color.copy()
+            depth = self.latest_depth.copy()
 
-                        for det in filtered:
-                            x_min = det.get("x_min", 0)
-                            y_min = det.get("y_min", 0)
-                            x_max = det.get("x_max", 0)
-                            y_max = det.get("y_max", 0)
+        # 라운드 로빈
+        url = SERVER_URLS[self.frame_idx % len(SERVER_URLS)]
+        self.frame_idx += 1
 
-                            cx_norm = (x_min + x_max) / 2
-                            cy_norm = (y_min + y_max) / 2
+        # 비동기 던지기
+        threading.Thread(
+            target=self._send_and_publish,
+            args=(url, color, depth),
+            daemon=True,
+        ).start()
 
-                            # 원본 픽셀 좌표
-                            cx_px = cx_norm * self.frame_w
-                            cy_px = cy_norm * self.frame_h
+    def _send_and_publish(self, url: str,
+                           color: np.ndarray, depth: np.ndarray):
+        try:
+            # 추론용 다운스케일
+            small = cv2.resize(color, (INFER_W, INFER_H))
+            ok, buf = cv2.imencode('.jpg', small, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            if not ok:
+                return
+            img_b64 = base64.b64encode(buf.tobytes()).decode('ascii')
 
-                            # 좌표 변환 모듈로 위임
-                            xyz = pixel_to_robot_xyz(
-                                cx_px, cy_px,
-                                self.frame_w, self.frame_h,
-                            )
-
-                            detected_objects.append({
-                                "label":     obj_label,
-                                "bbox":      [x_min, y_min, x_max, y_max],
-                                "center_2d": {"x": cx_norm, "y": cy_norm},
-                                "center_3d": xyz,
-                            })
-
-                    except Exception as e:
-                        self.get_logger().warn(f'{obj_label} 인식 오류: {e}')
-
+            payload = {
+                "image_b64": img_b64,
+                "labels": TARGET_OBJECTS,
+            }
+            r = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
+            if r.status_code != 200:
+                return
+            data = r.json()
+        except requests.exceptions.RequestException:
+            return  # 한 서버 응답 못 받아도 다른 라운드에서 회복
         except Exception as e:
-            self.get_logger().error(f'추론 실패: {e}')
+            self.get_logger().warn(f'요청 처리 오류: {e}')
             return
 
+        # 결과 → /detected_objects 메시지로 변환
+        raw_dets = data.get("detections", [])
+        filtered = filter_detections(raw_dets)
+
+        ch, cw = color.shape[:2]
+        objs = []
+        for d in filtered:
+            cx_norm = (d["x_min"] + d["x_max"]) / 2
+            cy_norm = (d["y_min"] + d["y_max"]) / 2
+            cx_px = int(cx_norm * cw)
+            cy_px = int(cy_norm * ch)
+
+            # ── depth 조회 (해당 픽셀 주변 5x5 평균) ──
+            depth_m = self._sample_depth(depth, cx_px, cy_px)
+
+            xyz = pixel_to_robot_xyz(cx_px, cy_px, cw, ch, depth_m=depth_m)
+
+            objs.append({
+                "label": d["label"],
+                "bbox": [d["x_min"], d["y_min"], d["x_max"], d["y_max"]],
+                "center_2d": {"x": cx_norm, "y": cy_norm},
+                "center_3d": xyz,
+                "depth_m": round(float(depth_m), 3) if depth_m else None,
+            })
+
         msg = String()
-        msg.data = json.dumps({"objects": detected_objects}, ensure_ascii=False)
+        msg.data = json.dumps({"objects": objs}, ensure_ascii=False)
         self.pub.publish(msg)
 
-        elapsed = time.time() - t0
-        if detected_objects:
-            labels = [o["label"] for o in detected_objects]
-            self.get_logger().info(
-                f'인식: {labels} ({elapsed:.2f}s)')
+    @staticmethod
+    def _sample_depth(depth: np.ndarray, cx: int, cy: int) -> Optional[float]:
+        """픽셀 주변 5x5 평균 depth (0 제외) — RealSense 노이즈 완화."""
+        h, w = depth.shape
+        x0, x1 = max(0, cx - 2), min(w, cx + 3)
+        y0, y1 = max(0, cy - 2), min(h, cy + 3)
+        patch = depth[y0:y1, x0:x1]
+        valid = patch[(patch > 0.05) & (patch < 2.0)]
+        if valid.size == 0:
+            return None
+        return float(np.median(valid))
 
     def destroy_node(self):
-        if self.cap.isOpened():
-            self.cap.release()
+        try:
+            self.rs_pipe.stop()
+        except Exception:
+            pass
         super().destroy_node()
 
 
