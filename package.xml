@@ -1,13 +1,17 @@
 <?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>nero_ai</name>
   <version>0.0.1</version>
-  <description>NERO AI pipeline</description>
-  <maintainer email="you@email.com">you</maintainer>
+  <description>AgileX Nero pick-and-place with MCP + MoonDream2 + Gemini</description>
+  <maintainer email="nero@example.com">nero</maintainer>
   <license>MIT</license>
+
   <depend>rclpy</depend>
   <depend>std_msgs</depend>
   <depend>geometry_msgs</depend>
+  <depend>sensor_msgs</depend>
+
   <export>
     <build_type>ament_python</build_type>
   </export>
